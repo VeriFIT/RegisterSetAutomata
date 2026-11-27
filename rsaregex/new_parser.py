@@ -20,6 +20,7 @@ class ParseError(Exception):
 
 g_state_id = 0 # for generating sequential ids for states
 g_back_referenced = {} # store all back-referenced capture group numbers and their lengths
+g_cg_chars = {}
 g_optional = {}
 g_anchor_start = False
 g_anchor_end = False
@@ -83,8 +84,28 @@ def _unanchor_aut(aut: NRA) -> NRA:
         new_aut.add_transition(t)
     return new_aut
 
-def _concatenate_aut(first: NRA, second: NRA) -> NRA:
+def _is_aut_only_epsilon(aut:NRA) -> bool:
+    for t in aut.delta:
+        if t.symbol != EPSILON:
+            return False
+    return True
+
+def _concatenate_aut(first: NRA, second: NRA, keep_epsilon = False) -> NRA:
     new_aut = NRA.empty()
+    if not keep_epsilon:
+        first_eps = _is_aut_only_epsilon(first)
+        second_eps = _is_aut_only_epsilon(second)
+        if first_eps and second_eps:
+            init_state = _get_new_state_id()
+            new_aut.add_q(init_state)
+            new_aut.add_i(init_state)
+            new_aut.add_f(init_state)
+            return new_aut
+        if first_eps:
+            return second
+        if second_eps:
+            return first
+
     new_aut.import_automaton(first)
     new_aut.import_automaton(second)
 
@@ -141,7 +162,7 @@ def _find_cg_by_num(cg_num: int, pattern: p.SubPattern) -> p.SubPattern:
             res = _find_cg_by_num(cg_num, sub_pat)
             if res != False:
                 return res
-        
+
         else:
             continue
     return False
@@ -173,9 +194,6 @@ def _find_opt_cgs(sub_pattern: p.SubPattern):
             sub_pat = av[2]
             if min == 1 and max == 1:
                 _find_opt_cgs(sub_pat)
-            # TODO: maybe should work if min=0, max=1 (have to check if sub_pat is a back-referenced capture group also)
-            # TODO: also possibly expandable if there is a bounded number of repetitions
-
         else:
             continue
 
@@ -233,12 +251,10 @@ def _get_cg_len(sub_pattern: p.SubPattern) -> (int, int) or False:
             max_len = add_with_maxrep(max_len, sub_max)
 
         elif op is c.GROUPREF:
-            # TODO: currently just looking at the result found earlier,
-            # should always be filled in before this one gets called
             cg_min_len, cg_max_len = g_back_referenced[av]
             min_len += cg_min_len
             max_len = add_with_maxrep(max_len, cg_max_len)
-    
+
         else:
             # unsupported construction
             raise ParseError("Unsupported construction used")
@@ -299,87 +315,6 @@ def _get_cg_chars(sub_pattern: p.SubPattern) -> (str, set()) or False:
     #print("length", length, "chars", chars)
     return chars
 
-
-#FIXME: probably should reuse more code from create_automaton
-def _check_fix_len(sub_pattern: p.SubPattern) -> (int, tuple) or False:
-    length = 0
-    chars = (' ', set())
-    for op, av in sub_pattern.data:
-        #print(op, av)
-        if op is c.BRANCH:
-            lens = []
-            #Check if length of all branches is equal
-            for b in av[1]:
-                b_ret = _check_fix_len(b)
-                if b_ret == False: #checking equality to false to prevent potential empty tuple shenanigans
-                    return False
-                b_len, b_chars = b_ret
-                lens.append(b_len)
-                chars = rsa_set_union(chars, b_chars)
-            assert(len(lens) > 0)
-            check_len = -1
-            for i in lens:
-                if check_len == -1:
-                    check_len = i
-                elif check_len != i:
-                    raise CaptureGroupError("Capture group with non-constant length")
-                    return False
-            length += check_len
-
-        elif op is c.MAX_REPEAT or op is c.MIN_REPEAT:
-            #check if max and min are the same
-            rep_min, rep_max, rep_pat = av
-            if rep_min != rep_max:
-                raise CaptureGroupError("Capture group with non-constant length")
-                return False
-            rep_ret = _check_fix_len(rep_pat)
-            if rep_ret == False: #checking equality to false to prevent potential empty tuple shenanigans
-                return False
-            rep_chars, rep_len = rep_ret
-            length += rep_len
-            chars = rsa_set_union(chars, rep_chars)
-
-        elif op is c.LITERAL:
-            length += 1
-            chars = rsa_set_add_char(chars, chr(av))
-
-        elif op is c.ANY:
-            length += 1
-            chars = ANYCHAR
-
-        elif op is c.IN:
-            length += 1
-            chars = _get_set_chars(av)
-            if chars == False: return False
-
-        elif op is c.NOT_LITERAL:
-            length += 1
-            chars = rsa_set_union(chars, ('^', {chr(av)}))
-
-        elif op is c.SUBPATTERN:
-            group_num = av[0]
-            sub_sub_pattern = av[3]
-            sub_ret = _check_fix_len(sub_sub_pattern)
-            if sub_ret == False: return False
-            sub_len, sub_chars = sub_ret
-            length += sub_len
-            chars = rsa_set_union(chars, sub_chars)
-
-        elif op is c.GROUPREF:
-            #TODO: should be allowed?
-            raise ParseError("Unsupported construction")
-            return False
-
-        else:
-            # unsupported construction
-            raise ParseError("Unsupported construction")
-            return False
-    #end for loop
-    #freeze set:
-    chars = (chars[0], frozenset(chars[1]))
-    #print("length", length, "chars", chars)
-    return length, chars
-
 # check if capture group is static length and
 # create an automaton with all the possible characters
 def _capt_group_aut(sub_pattern: p.SubPattern, capt_num: int) -> NRA:
@@ -390,16 +325,22 @@ def _capt_group_aut(sub_pattern: p.SubPattern, capt_num: int) -> NRA:
     q1 = _get_new_state_id()
 
     if max_len == 0 or _check_opt(capt_num):
-        return NRA({q1}, set(), set(), {q1}, {q1}) #TODO: optional should probably be union of this automaton and the one created below 
+        return NRA({q1}, set(), set(), {q1}, {q1})
 
-    if not capt_num in g_optional.keys() and (max_len != 1 or min_len != 1):
-        raise CaptureGroupError("Capture group is too long")
-        return False
+    if g_simulate_transducer:
+        if not capt_num in g_optional.keys() and (max_len != min_len) or max_len == c.MAXREPEAT:
+        #if max_len == c.MAXREPEAT: #for checking bounded
+            raise CaptureGroupError("Capture group with non-constant length")
+    else:
+        if not capt_num in g_optional.keys() and (max_len != 1 or min_len != 1):
+            raise CaptureGroupError("Capture group is too long")
+            return False
 
     ret = _get_cg_chars(sub_pattern)
 
     if ret == False: return False
     symb = ret
+    g_cg_chars[capt_num] = ret
 
     #create automaton
     q2 = _get_new_state_id()
@@ -413,7 +354,11 @@ def _backref_aut(capt_num: int) -> NRA:
         return NRA({q1}, set(), set(), {q1}, {q1})
     q2 = _get_new_state_id()
     r = _reg_of_num(capt_num)
-    t = Transition(q1, ANYCHAR, {r}, set(), {}, q2)
+
+    chars = g_cg_chars.get(capt_num)
+    assert(chars != None)
+
+    t = Transition(q1, chars, {r}, set(), {}, q2)
     return NRA({q1, q2}, {r}, {t}, {q1}, {q2})
 
 #copy automaton while making sure state ids are kept unique
@@ -435,6 +380,21 @@ def _iterate_aut(aut:NRA) -> NRA:
     ret_aut = NRA.empty()
     ret_aut.import_automaton(aut)
     #add transition from every final state to every initial state
+
+    if len(aut.delta) == 1:
+        trans_old = next(iter(aut.delta)) # only one trans        
+        single_state = _get_new_state_id()
+        trans_new = Transition(single_state,trans_old.symbol, 
+                               trans_old.eqGuard,
+                               trans_old.diseqGuard,
+                               trans_old.update,
+                               single_state)
+        ret_aut.Q = {single_state}
+        ret_aut.I = {single_state}
+        ret_aut.F = {single_state}
+        ret_aut.delta = {trans_new}
+        return ret_aut
+
     for f in aut.F:
         for i in aut.I:
             t = Transition(f, EPSILON, set(), set(), {}, i)
@@ -460,7 +420,7 @@ def _repeat_aut(aut: NRA, min: int, max) -> NRA:
         for i in range(max-min):
             tmp = _copy_aut(aut)
             tmp_states = tmp_states.union(tmp.F)
-            ret_aut = _concatenate_aut(ret_aut, tmp) 
+            ret_aut = _concatenate_aut(ret_aut, tmp, keep_epsilon=True) 
             ret_aut.F = ret_aut.F.union(tmp.F)
         ret_aut.F = ret_aut.F.union(tmp_states)
     return ret_aut
@@ -613,7 +573,7 @@ def _create_automaton(sub_exp, level=0):
 
         else:
             raise ParseError("Unsupported construction")
-            # UNSUPPORTED: (TODO: which should be supported?)
+            # UNSUPPORTED:
             #       ASSERT
             #       ASSERT_NOT
             #       AT_BEGINNING_STRING
@@ -624,6 +584,7 @@ def _create_automaton(sub_exp, level=0):
 
         #end of elif chain
         if aut_tmp == False:
+            raise ParseError("Unsupported construction")
             return False
         ret_automaton = _concatenate_aut(ret_automaton, aut_tmp)   
     #end of for loop
@@ -643,7 +604,6 @@ def create_nra(pattern: str) -> Union[NRA, bool]:
     g_state_id = 0
     pat = p.parse(pattern)
     _find_br_cg(pat)
-    #TODO: possibly could use lengths to decide optionality
     _get_br_cg_lengths(pat)
     _find_opt_cgs(pat)
     combinations = _gen_opt_combinations()

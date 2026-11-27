@@ -1,7 +1,11 @@
 #Author: Jan Vašák, 24.9.2022
 
 import itertools as it
+import networkx as nx
 import copy
+import re
+import json
+# from rsaregex.rsa_draw import draw_automaton
 
 MYEMPTY = (' ', frozenset())
 ANYCHAR = ('^', frozenset())
@@ -14,6 +18,16 @@ CAPTURECHAR = "capturechar"
 BACKREFCHAR = "backrefchar"
 BOTTOM = "NULL"
 SIGMASTAR = "sstar"
+
+INSTR_DECODE = "DECODE"
+INSTR_ACCEPT = "ACCEPT"
+INSTR_FAIL = "FAIL"
+INSTR_JUMP = "JUMP"
+INSTR_TEST = "TEST"
+INSTR_UPDATE = "UPDATE"
+INSTR_ADDIN = "ADDIN"
+INSTR_CLEAR = "CLEAR"
+INSTR_SWAP = "SWAP"
 
 class DeterminizationError(Exception):
     def __init__(self, message):
@@ -92,6 +106,7 @@ def rsa_is_char_in(char, t):
 
 def rsa_intersect_n_sets(sets):
     '''intersects all sets specified in param sets'''
+    # cachovat pro stejne mnoziny stavu
     n = len(sets)
     if n >= 1:
         tmp = sets[0]
@@ -154,6 +169,478 @@ def _create_minterms(sets):
     #print(minterms)
     return minterms
 
+# create a list of unicode ranges from myset of symbols
+UNICODE_MIN = 0x0000
+UNICODE_MAX = 0x10FFFF
+SURR_START = 0xD800
+SURR_END   = 0xDFFF
+UNICODE_RANGE = [(UNICODE_MIN, SURR_START-1), (SURR_END+1, UNICODE_MAX)]
+def _myset_to_ranges(myset):
+    if myset == MYEMPTY:
+        return []
+    if myset == ANYCHAR:
+        return UNICODE_RANGE
+    out = []
+    neg, charset = myset
+    charlist = sorted(charset)
+    l = r = ord(charlist[0])
+    for c in charlist[1:]:
+        c = ord(c)
+        if c == r+1:
+            r = c
+        else:
+            out.append((l,r))
+            l = r = c
+    out.append((l,r))
+
+    #complement ranges if negated
+    if neg == '^':
+        compl = []
+        for minl, maxr in UNICODE_RANGE:
+            c = minl
+            for l,r in out:
+                # skip non-overlapping 
+                if r < minl or l > maxr:
+                    continue
+
+                # clamp l and r into the range
+                l = max(minl, l)
+                r = min(maxr, r)
+
+                if c < l:
+                    compl.append((c, l-1))
+                c = r+1
+            if c <= maxr:
+                compl.append((c, maxr))
+        out = compl
+
+    return out
+
+class BDDTerm:
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        if not isinstance(other, BDDTerm):
+            return False
+        return self.value == other.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+class BDDNode:
+    def __init__(self, hi, lo, var, reg_id, parents: list):
+        self.hi = hi
+        self.lo = lo
+        self.var = var
+        self.reg_id = reg_id
+        self.parents = parents
+
+    def is_filled(self):
+        return self.hi is not None and \
+            self.lo is not None and \
+            self.var is not None
+
+    # def __eq__(self, value):
+    #     return self is value
+
+    # def __hash__(self):
+    #     return hash(id(self))
+    
+    def get_key(self):
+        return (id(self.hi), id(self.lo), self.var)
+    
+
+class MTBDD:
+    def __init__(self):
+        self.nodes = {} # a dict used like a set, but can retrieve the canonical value
+                        # use nodes[node.get_key()] = node to add a node 
+        self.terms = {}
+        self.root = BDDNode(None, None, 0, None, set())
+
+    def is_empty(self):
+        return self.root.hi == None and self.root.lo == None
+
+    def create_term(self, value):
+        newterm = BDDTerm(value)
+        tmp = self.terms.get(newterm)
+        if tmp is None: #add new node
+            self.terms[newterm] = newterm
+        else:
+            newterm = tmp #replace with canonical node
+        return newterm
+                
+
+    def create_node(self, var, reg_id, parent):
+        return BDDNode(None, None, var, reg_id, {parent})            
+
+    def add_path(self, var_values: list, term_value):
+        # terms are easy, but should I create
+        node = self.root
+        nvars = len(var_values)
+        if nvars > 0 and node.reg_id is None: #fill root id if missing
+            node.reg_id = var_values[0][0]
+        for i, (_,x) in enumerate(var_values):
+            # print(i,x)
+            # TODO: make a function like create_child(self, vard_idx, nvars, term_value)?
+            if x: #go high
+                if node.hi is not None:
+                    next_node = node.hi
+                else:
+                    if i == nvars-1: # newnode will be term
+                        node.hi = self.create_term(term_value)
+                        return
+                    else:
+                        node.hi = self.create_node(i+1, var_values[i+1][0], node) #var_values[i+1][0] is the reg_id of the next node
+                        next_node = node.hi
+            else: #go low
+                if node.lo is not None:
+                    next_node = node.lo
+                else:
+                    if i == nvars-1: #newnode will be term
+                        node.lo = self.create_term(term_value)
+                        return
+                    else:
+                        node.lo = self.create_node(i+1,var_values[i+1][0], node)
+                        next_node = node.lo
+            # if node.is_filled():
+            #     self.store_node(node)
+            node = next_node
+
+    def create_level_arr(self, nvars):
+        arr = [set() for _ in range(nvars)]
+        curr = self.root
+        self.create_level_arr_impl(arr, curr)
+        return arr
+
+    def create_level_arr_impl(self, arr, curr):
+        if isinstance(curr, BDDTerm):
+            return
+        arr[curr.var].add(curr)
+        self.create_level_arr_impl(arr, curr.hi)
+        self.create_level_arr_impl(arr, curr.lo)
+
+    def remove_dupl_nodes(self, nvars):
+        merged = False
+        level_arr = self.create_level_arr(nvars)
+        self.nodes = {} #clear
+        for nodelist in reversed(level_arr): #start with lowest level (=> children must be stored already)
+            for node in nodelist:
+                table_node = self.nodes.get(node.get_key())
+                if table_node is None:
+                    self.nodes[node.get_key()] = node
+                else: # MERGING into table node
+                    merged = True
+                    #re-route edges to new node
+                    for p in node.parents:
+                        if p.hi is node:
+                            p.hi = table_node
+                        if p.lo is node:
+                            p.lo = table_node
+                        table_node.parents.add(p)
+                    for child in [node.hi, node.lo]:
+                        if isinstance(child, BDDNode):
+                            child.parents.discard(node) #id lo == hi we get in trouble remove
+                            child.parents.add(table_node)
+        return merged
+    
+    def delete_useless_nodes_impl(self, curr):
+        if isinstance(curr, BDDTerm):
+            return False
+        if curr.hi == curr.lo: #delete this node
+            child = curr.hi # we can use lo or hi
+            if isinstance(child, BDDNode):
+                child.parents.remove(curr)
+            for p in curr.parents:
+                if p.lo is curr:
+                    p.lo = child
+                if p.hi is curr:
+                    p.hi = child
+                if isinstance(child, BDDNode):
+                    child.parents.add(p)
+            if curr == self.root:
+                self.root = child
+            self.delete_useless_nodes_impl(child)
+            return True #we deleted so true no matter what
+
+        else:
+            rethi = self.delete_useless_nodes_impl(curr.hi)
+            retlo = self.delete_useless_nodes_impl(curr.lo)
+            return rethi or retlo
+
+    def delete_useless_nodes(self):
+        return self.delete_useless_nodes_impl(self.root)
+
+    def reduce(self, nvars):
+        changed = True
+        while changed:
+            changed = False
+            merged = self.remove_dupl_nodes(nvars)
+            deleted = self.delete_useless_nodes()
+            changed = merged or deleted
+
+    def write_code(self, prg: list, prefix: str):
+        id_map = {}
+        written = set()
+        self.write_code_impl(self.root, prg, id_map, written, prefix)
+    
+    def write_code_impl(self, node: BDDNode, prg: list, id_map: dict, written: set, prefix: str):
+        def get_id(n):
+            nid = id_map.get(n)
+            if nid is None:
+                nid = len(id_map)
+                id_map[n] = nid
+            return nid
+        
+        def get_label(succ):
+            if isinstance(succ, BDDNode):
+                return prefix+"_node_"+str(get_id(succ))
+            else:
+                assert(isinstance(succ, BDDTerm))
+                return prefix+f"_{succ.value}"
+
+        assert(isinstance(node, BDDNode))
+        if node not in written:
+            prg.append(f"{get_label(node)}:")
+            written.add(node)
+        hi_lab = get_label(node.hi)
+        lo_lab = get_label(node.lo)
+        prg.append(INSTR_TEST+f" {node.reg_id} {hi_lab}")
+        prg.append(INSTR_JUMP+f" {lo_lab}")
+        for succ in [node.hi, node.lo]:
+            if isinstance(succ, BDDNode):
+                self.write_code_impl(succ, prg, id_map, written, prefix)
+
+class DecodeTreeNode:
+    def __init__(self):
+        self.children = []
+        self.label = None
+    
+    def init_children(self, nclasses):
+        self.children = [None for _ in range(nclasses)]
+
+def _serialize_decode_tree(node):
+    if node is None: #for safety
+        return None
+
+    if node.children != []:
+        node.label = None 
+
+        return {
+            "label": node.label,
+            "children": [
+                _serialize_decode_tree(child) for child in node.children
+            ]
+        }
+    elif node.label == None:
+        return {
+            "label" : -1
+        }
+    else:
+        return {
+            "label" : node.label
+        }
+
+def _check_char_in_decode_tree(char, tree: DecodeTreeNode, bytemap):
+    chbytes = char.encode("utf-8")
+    curr = tree
+    for b in chbytes:
+        b = bytemap[b] #work with byteclass
+        if curr == None:
+            return -1
+        curr = curr.children[b] #descend
+    return curr.label
+
+def _add_char_to_decode_tree(char, tree: DecodeTreeNode, leafptrarr, bytemap, nclasses):
+    #assumes char is not already in tree, and that tree is not None
+    assert(tree != None)
+    chbytes = char.encode("utf-8")
+    curr = tree
+    for b in chbytes:
+        b = bytemap[b] #work with byteclass
+        if curr.children == []:
+            curr.init_children(nclasses)
+        if curr.children[b] == None: #uninitialized child
+            curr.children[b] = DecodeTreeNode()
+        curr = curr.children[b] #descend
+    #decoded, number the leaf
+    idx = len(leafptrarr)
+    curr.label = None
+    leafptrarr.append(curr)
+    return idx
+
+def _pad_arr_to_idx(arr, idx, val=0):
+    arr.extend([val] * (idx + 1 - len(arr)))
+
+def _find_dangling(tree: DecodeTreeNode, dangling):
+    for i in range(len(tree.children)):
+        if tree.children[i] == None:
+            newnode = DecodeTreeNode()
+            tree.children[i] = newnode
+            dangling.append(newnode)
+        else:
+            _find_dangling(tree.children[i], dangling)
+
+def _generate_decode_tree(charsets, bytemap, nclasses, state_id):
+    processed_chars = {}
+    decode_tree = DecodeTreeNode()
+    leafptrarr = []
+    leafmaps = [[] for _ in charsets] #TODO: leafmaps could be bitarrays
+    seen_neg = False
+
+    # create tree structure by adding all characters first
+    for myset in charsets.keys():
+        neg, chset = myset
+        if neg == "^":
+            seen_neg = True
+        for ch in chset:
+            leafarr = leafmaps[charsets[myset]]
+            if ch in processed_chars.keys():
+                idx = processed_chars[ch]
+            else:
+                idx = _add_char_to_decode_tree(ch, decode_tree, leafptrarr, bytemap, nclasses)
+                processed_chars[ch] = idx
+            if idx >= len(leafarr):
+                _pad_arr_to_idx(leafarr, idx)
+            leafarr[idx] = 1
+    
+    # find dangling leaves
+    dangling = []
+    if seen_neg:
+        _find_dangling(decode_tree, dangling)
+
+
+    #assign labels correctly
+    for myset in charsets.keys():
+        neg, _ = myset
+        yesval = 0 if neg == "^" else 1
+        setnum = charsets[myset]
+        map = leafmaps[setnum]
+        for i in range(len(map)):
+            if map[i] == yesval:
+                leafptrarr[i].label = f"{state_id}_{setnum}"
+        # add label to dangling ends
+        if neg == "^":
+            for d in dangling:
+                d.label = f"{state_id}_{setnum}"
+    return decode_tree
+
+
+
+def remove_update_cycles(graph: nx.DiGraph):
+    sccs = list(nx.strongly_connected_components(graph))
+    next_reg_id = 0
+    old_to_new = {}
+    new_to_old = {}
+    # if graph is NOT acyclic, split some nodes
+    while len(sccs) < graph.number_of_nodes():        
+        to_split = []
+        for nodes in sccs:
+            if len(nodes) > 1:
+                # add node with max out degree
+                to_split.append(max(nodes, key=lambda n: graph.out_degree(n)))
+        for node in to_split:
+            new_node = f"free_{next_reg_id}"
+            next_reg_id += 1
+            old_to_new[node] = new_node
+            new_to_old[new_node] = node
+            outgoing = list(graph.out_edges(node))
+
+            graph.add_node(new_node)
+            for _, v in outgoing:
+                graph.add_edge(new_node, v)
+            graph.remove_edges_from(outgoing)
+        # new sccs from the updated graph
+        sccs = list(nx.strongly_connected_components(graph))
+    return old_to_new, new_to_old
+
+def create_update_graph(upd_list):
+    graph = nx.DiGraph()
+    for r, rhs in upd_list:
+        graph.add_node(r)
+        for x in rhs:
+            if x == r or x == IN:
+                continue
+            graph.add_edge(r, x)
+    return graph
+
+def transform_updates(upd_list):
+    #reconstruct update:
+    update = {k:v for k,v, in upd_list}
+    #build update graph and remove cycles by splitting
+    # updates into reg_new <- update[reg], reg <- reg_new
+    graph = create_update_graph(upd_list)
+    old_to_new, new_to_old = remove_update_cycles(graph)
+    # order updates based on dependencies
+    order = list(nx.topological_sort(graph))
+    
+    #rebuild updates from upd_list in the correct order
+    updates_new = list()
+    for node in order:
+        if node in old_to_new.keys():
+            # reg <- reg_new
+            updates_new.append((node, {old_to_new[node]}))
+        elif node in new_to_old.keys():
+            old = new_to_old[node]
+            updates_new.append((node, update[old]))
+        else:
+            updates_new.append((node, update[node]))
+    return updates_new
+
+
+def process_vm_code(prg, mem, prgout = "prg.out", memout = "mem.out"):
+    labelmap = {}
+    cnt = 0
+    code = []
+    outprgfile = open(prgout, "w")
+    outmemfile = open(memout, "w")
+
+    for line in prg:
+        line = line.strip()
+        if line == "":
+            continue
+
+        if line.endswith(":"):
+            labelstr = line[:-1]
+            assert(labelstr not in labelmap.keys())
+            labelmap[labelstr] = str(cnt)
+        else:
+            cnt += 1
+            code.append(line)
+
+    # second pass
+    for line in code:
+        words = line.split()
+        outstr = ""
+        for word in words:
+            if word in labelmap.keys():
+                outstr += labelmap[word] + " "
+            else:
+                outstr += word + " "
+        print(outstr, file=outprgfile)
+
+    memstr = json.dumps(mem,indent=1).splitlines()
+
+    for line in memstr:
+        print(
+            re.sub(
+                r'("label":\s*)"([^"]+)"',
+                lambda m: f'{m.group(1)}{labelmap[m.group(2)]}',
+                line
+            ), file=outmemfile
+        )
+
+
+def print_vm_code_debug(prg, mem, prgout = "prg.out", memout = "mem.out"):
+    outprgfile = open(prgout, "w")
+    outmemfile = open(memout, "w")
+    for line in prg:
+        line = line.strip()
+        print(line, file = outprgfile)
+
+    json.dump(mem, outmemfile, indent=2)
+    
+
 class Transition:
     """! Class representing a transition
     """
@@ -166,10 +653,16 @@ class Transition:
         self.dest = dest
 #end of class Transition
 
+def _freeze_update(upd):
+    return frozenset({(rhs,frozenset(lhs)) for rhs,lhs in upd.items()})
+
 class MacroState:
     def __init__(self):
         self.states = set()
         self.mapping = {}
+
+    def key(self):
+        return (frozenset(self.states), frozenset(self.mapping.items()))
 
 
 class RsA:
@@ -221,10 +714,50 @@ class RsA:
                 break
         return closure
 
+    def outgoing_trans(self,q):
+        ret = set()
+        for t in self.delta:
+            if t.orig == q:
+                ret.add(t)
+        return ret
+    
+    def incoming_trans(self,q):
+        ret = set()
+        for t in self.delta:
+            if t.dest == q:
+                ret.add(t)
+        return ret
+
     def remove_eps(self):
         '''removes epsilon transitions'''
         deltaNew = set()
         newF = set()
+        to_remove = set()
+
+        # if the ONLY outoging transition is epsilon
+        # we can simply merge this state into the next
+        for q in self.Q:
+            # removing final states is difficult,
+            # since in general we cannot move finality
+            # to the next state
+            if q in self.F:
+                continue
+
+            outgoing = self.outgoing_trans(q)
+            
+            if len(outgoing) == 1:
+                only_trans = next(iter(outgoing))
+                if only_trans.symbol == EPSILON:
+                    to_remove.add(q)
+                    if q in self.I:
+                        self.I.remove(q)
+                        self.I.add(only_trans.dest)
+                    # re-route transitions
+                    for t in self.incoming_trans(q):
+                        t.dest = only_trans.dest
+        for q in to_remove:
+            self.Q.remove(q)
+        
         for q in self.Q:
             epsClos = self.eps_closure(q)
             if not epsClos.isdisjoint(self.F):
@@ -296,6 +829,9 @@ class DRsA(RsA):
                 result[key] = set()
         return result
 
+    def _create_state_id_map(self):
+        return {s.key() : i for i, s in enumerate(self.Q)}
+
     def _update_regs(self, regConf, up, input):
         '''Update Registers.
         Unspecified registers lose their value!'''
@@ -311,6 +847,27 @@ class DRsA(RsA):
             newConf[r] = tmp
         return newConf
     
+    #tests guards of a transition
+    def _create_memb_map(self, input, regConf,):
+        memb_map = dict()
+        for r in self.R:
+            if input in regConf[r]:
+                memb_map[r] = True
+            else:
+                memb_map[r] = False
+        return memb_map
+    
+    #tests guards of a transition
+    def _test_memb_map(self, memb_map, eqG, diseqG):
+        for g in eqG:
+            if not memb_map[g]:
+                return False
+                
+        for g in diseqG:
+            if memb_map[g]:
+                return False
+        return True
+
     #tests guards of a transition
     def _guard_test(self, input, regConf, eqG, diseqG):
         for g in eqG:
@@ -342,7 +899,6 @@ class DRsA(RsA):
 
             found = False
             trans_f = None
-            #TODO: do one test and then check the bitmap with transitions
             for t in self.trans_dict[(frozenset(c.states),frozenset(c.mapping.items()))]:
                 if rsa_is_char_in(s, t.symbol) and self._guard_test(s, regConf, t.eqGuard, t.diseqGuard):
                     #if found:
@@ -382,11 +938,14 @@ class DRsA(RsA):
                 if t.orig.states != q.states or t.orig.mapping != q.mapping :
                     continue
                 P1=set()
+                # up_aux maps a register to the classes its updated with
                 up_aux = {}
                 up_new = {}
+                # build up_aux
                 for r in self.R:
                     Y = set()
                     for y in t.update[r]:
+                        # find class of y
                         if y != IN:
                             for C in P:
                                 if y in C:
@@ -394,13 +953,17 @@ class DRsA(RsA):
                                     break
                         Y.add(y)
                     up_aux[r] = Y
+                # build new partition
                 for Y in up_aux.values():
                     C1 = set()
                     for r in self.R:
                         if up_aux[r] == Y:
                             C1.add(r)
-                    P1.add(frozenset(C1))
+                    if Y != set():
+                        P1.add(frozenset(C1))
                     up_new[frozenset(C1)] = Y
+
+                # build (n)eq guard
                 g_eq_new = set()
                 g_neq_new = set()
                 for C in P:
@@ -409,8 +972,12 @@ class DRsA(RsA):
                             g_eq_new.add(C)
                         if r in t.diseqGuard:
                             g_neq_new.add(C)
+
+                # make sure register list is complete
                 for C in P1:
                     Rnew.add(C)
+
+                # check whether created state already exists, and add it if not
                 newstate = True
                 for q1 in Qnew:
                     if q1[0].states == t.dest.states and\
@@ -423,6 +990,7 @@ class DRsA(RsA):
                     worklist.append((t.dest, frozenset(P1)))
                 deltaNew.add(Transition((q, frozenset(P)), t.symbol, g_eq_new, g_neq_new, up_new, (t.dest, frozenset(P1))))
                 
+                # check overapprox on the created transition
                 for q1 in t.dest.states:
                     U = [[]]
                     Rq1 = set()
@@ -442,6 +1010,7 @@ class DRsA(RsA):
                             if x[1] == IN:
                                 x[1] = frozenset({IN})
                         for t1 in oldNRA.delta:
+                            # print(t1.orig,"->", t1.dest,"| up =", t1.update)
                             if t1.dest != q1:
                                 continue
                             found = True
@@ -450,8 +1019,10 @@ class DRsA(RsA):
                                     found = False
                                     break
                             if found:
+                                # print("found")
                                 break
                         if not found:
+                            # draw_automaton(DRsA(Qnew, Rnew, deltaNew, Inew, set()), "postprocessed")
                             return False
         return True
 
@@ -530,6 +1101,42 @@ class NRA(RsA):
             t.eqGuard = eqNew
             t.diseqGuard = diseqNew
         self.R = RNew
+
+    def remove_untested_regs(self):
+        changed = True
+        reg_deps_on = {r:set() for r in self.R}
+        while changed:
+            changed = False
+            for t in self.delta:
+                for r in self.R:
+                    y = t.update[r]
+                    if y == IN or y == BOTTOM:
+                        continue
+                    y_deps = reg_deps_on[y]
+                    r_add_deps = y_deps.union({y})
+                    if not r_add_deps.issubset(reg_deps_on[r]):
+                        changed = True
+                        reg_deps_on[r] = reg_deps_on[r].union(r_add_deps)
+        
+        tested_regs = set()
+        for t in self.delta:
+            for r in t.eqGuard.union(t.diseqGuard):
+                tested_dep = reg_deps_on[r].union({r})
+                tested_regs = tested_regs.union(tested_dep)
+
+        self.R = tested_regs
+        for t in self.delta:
+            assert(t.eqGuard.issubset(tested_regs))
+            assert(t.diseqGuard.issubset(tested_regs))
+            new_up = {}
+            for r in t.update.keys():
+                if r in tested_regs:
+                    y = t.update[r]
+                    assert(y == IN \
+                           or y == BOTTOM \
+                           or y in tested_regs)
+                    new_up[r] = y
+            t.update = new_up
 
     def preprocess(self):
         '''run the preprocessing algorithm on the NRA
@@ -626,13 +1233,125 @@ class NRA(RsA):
         self.delta = deltanew
 
 
-    def determinize(self, postprocess=False, track_sizes=True):
+    def _create_bytemap(self):
+        #DEBUG: trivial bytemap
+        return [i for i in range(256)], 256
+
+    def generate_vm_code(self):
+        self.remove_eps()
+        self.remove_unreachable()
+        drsa = self.determinize(postprocess=True) #let it crash if non-determinizable for now
+        statemap = drsa._create_state_id_map()
+        prg = []
+        bytemap, nclasses = self._create_bytemap()
+        mem = [None for _ in drsa.Q]
+        reglist = sorted(drsa.R) # establish fixed order
+        regmap = {r:i for i, r in enumerate(reglist)} | \
+            {f"free_{i}":len(reglist)+i for i in range(len(reglist))}
+        assert(len(drsa.I) == 1)
+        init_state = next(iter(drsa.I))
+        drsa.Q.remove(init_state)
+        for s in [init_state, *drsa.Q]:
+
+            tdkey = (frozenset(s.states),frozenset(s.mapping.items()))
+            state_id = statemap[s.key()]
+            prg.append(f"state_{state_id}:") #label
+
+            for f in drsa.F:
+                if s.states == f.states and s.mapping == f.mapping:
+                    prg.append(INSTR_ACCEPT)
+                    break
+
+            # no transitions to decode
+            if drsa.trans_dict[tdkey] == set():
+                prg.append(INSTR_FAIL)
+                continue
+
+            prg.append(INSTR_DECODE + f" {state_id}")
+            
+            # group transitions from s by symbol
+            charsets = {}
+            charsetcnt = 0
+            charset_trans = {}
+            for t in drsa.trans_dict[tdkey]:
+                if t.symbol not in charsets.keys():
+                    charsets[t.symbol] = charsetcnt
+                    charset_trans[charsetcnt] = []
+                    charsetcnt += 1
+                idx = charsets[t.symbol]
+                charset_trans[idx].append(t)
+            decode_tree = _generate_decode_tree(charsets, bytemap, nclasses, state_id)
+            mem[state_id] = _serialize_decode_tree(decode_tree)
+
+            for chidx in charset_trans.keys(): #iterate over groups of transitions
+                prg.append(f"{state_id}_{chidx}:")
+                mtbdd = MTBDD()
+                uniq_trans = {}
+                #decide transition
+                for t in charset_trans[chidx]:
+                    trans_key = (_freeze_update(t.update), statemap[t.dest.key()])
+                    trans_id = uniq_trans.get(trans_key)
+                    if trans_id is None:
+                        trans_id = len(uniq_trans)
+                        uniq_trans[trans_key] = trans_id
+
+                    var_values = []
+                    for r in reglist: #build vector for mtbdd
+                        if r in t.eqGuard:
+                            var_values.append((regmap[r], 1))
+                        elif r in t.diseqGuard:
+                            var_values.append((regmap[r], 0))
+                    mtbdd.add_path(var_values, trans_id)
+                if len(uniq_trans) > 1:
+                    # dump_mtbdd(mtbdd)
+                    mtbdd.reduce(len(var_values))
+
+                    mtbdd.write_code(prg, f"{state_id}_{chidx}")
+
+                    #print transition update and move
+                for trans_key, trans_id in uniq_trans.items():
+                    upd, dest_id = trans_key
+                    upd = transform_updates(upd)
+                    prg.append(f"{state_id}_{chidx}_{trans_id}:") #label
+                    for lhs,rhs in upd:
+                        rhs = set(rhs) # unfreeze set
+
+                        if len(rhs) == 1:
+                            item = next(iter(rhs))
+                            if item.startswith("free"):
+                                prg.append(INSTR_SWAP+f" {regmap[lhs]} {regmap[item]}")
+                                continue
+
+                        if lhs not in rhs:
+                            if lhs in s.mapping.keys() and s.mapping[lhs] > 0:
+                                prg.append(INSTR_CLEAR+f" {regmap[lhs]}")
+                        else:
+                            rhs.remove(lhs)
+                        
+                        addin = False
+                        if IN in rhs:
+                            addin = True
+                            rhs.remove(IN)
+
+                        if len(rhs) > 0:
+                            str_rhs = " ".join([str(regmap[r]) for r in rhs])
+                            prg.append(INSTR_UPDATE+" "+str(regmap[lhs])+" "+str_rhs)
+
+                        if addin:
+                            prg.append(INSTR_ADDIN + f" {regmap[lhs]}")
+
+                    prg.append(INSTR_JUMP+f" state_{dest_id}")
+            # prg.append(INSTR_FAIL)
+        return prg, mem, len(regmap)
+
+    def determinize(self, postprocess=False, track_sizes=True) -> DRsA:
         '''Determinise the NRA into a DRsA'''
         overapprox = False
         #fill in implicit updates
         self.complete_updates()
         self.make_register_local()
         self.fill_with_bottom()
+        self.remove_untested_regs()
         newA = DRsA(set(), self.R, set(), set(), set())
         worklist = [] 
         #Q′ ← worklist ← I′ ← {(I, c0 = {r → 0 | r ∈ R})}:
@@ -647,9 +1366,8 @@ class NRA(RsA):
         while worklist != []:
             sc = worklist.pop(-1)
             #print(f"({sc.states}, {sc.mapping})")
-            #create minterms of all transitions used in a given set of states into A
-            sets = set()
             regs0 = set()
+            sets = set()
             for t in self.delta:
                 if t.orig in sc.states:
                     sets.add(t.symbol)
@@ -660,8 +1378,8 @@ class NRA(RsA):
                 if sc.mapping[r] != 0:
                     regs.add(r)
 
+            #create minterms of all transitions used for a given set of states into A
             A = _create_minterms_symb(list(sets))
-            #TODO: add mintermification before powerset to 'join' some registers if there's no reason to separate them
             G = set(powerset(regs))
             #print(A)
             for a in A:
@@ -737,6 +1455,7 @@ class NRA(RsA):
                                             found_conf = True
                                             break
                                 if not found_conf:
+                                    #print("overapproxes")
                                     overapprox = True
                                     if not postprocess:
                                         raise DeterminizationError("Overapproximation detected")
@@ -759,7 +1478,6 @@ class NRA(RsA):
                     s1c1.states = S1
                     s1c1.mapping = c1
                     found = False
-                    #TODO: optimize this membership test if possible
                     for q1 in newA.Q:
                         #orig:
                         if s1c1.states == q1.states and s1c1.mapping == q1.mapping:
@@ -781,5 +1499,5 @@ class NRA(RsA):
                 raise DeterminizationError("Overapproximation detected")
                 return -1
         newA.trans_dict = newA._create_trans_dict()
-        return newA     
+        return newA
 #end of class NRA
